@@ -3,177 +3,347 @@ import cv2
 import json
 import base64
 import numpy as np
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Tuple, Optional
 from openai import OpenAI
-import dotenv
 
+import dotenv
 dotenv.load_dotenv()
 
-
-def find_best_product_placement_interval(
+def find_best_product_placement_shot(
     video_path: str,
-    step: int = 5,
-    triplet_gap: int = 2,
-    max_llm_candidates: int = 20,
+    min_shot_sec: float = 1.0,
+    max_shot_sec: float = 5.0,
     resize_width: int = 640,
-    cut_threshold: float = 0.55,
-    motion_threshold: float = 1.5,
-    min_interval_len: int = 8,
+    max_llm_shots: int = 3,
+    sample_frames_per_shot: int = 4,
 ) -> Dict[str, Any]:
     """
-    Analyze a video and return the best frame interval for product placement.
+    Detect cuts, evaluate each shot for stable background, and ask the LLM
+    whether the shot is suitable for product placement.
 
-    Strategy
-    --------
-    1. Read video and sample candidate center frames.
-    2. For each candidate center i, build triplet (i-gap, i, i+gap).
-    3. Use cheap CV metrics first:
-         - frame similarity
-         - optical-flow-like motion proxy
-         - texture / emptiness proxy
-       to shortlist candidates.
-    4. For shortlisted candidates, ask the LLM if the place is good for insertion.
-    5. Pick the best center frame using combined CV + LLM score.
-    6. Expand around the best frame with CV-only scene continuity search:
-         - stop at cuts
-         - stop when background changes too much
-    7. Return frame numbers and reasons.
+    Rules:
+    - ignore shots shorter than 1 sec
+    - ignore shots longer than 5 sec
+    - people moving is acceptable
+    - background/camera instability is not acceptable
+    - send several representative frames from the shot to the LLM
 
-    Returns
-    -------
-    dict with:
-        {
-          "best_center_frame": int,
-          "scene_start_frame": int,
-          "scene_end_frame": int,
-          "triplet_checked": [a, b, c],
-          "score": float,
-          "explanations": [...],
-          "llm_analysis": {...}
-        }
+    Returns:
+    {
+        "best_shot_start_frame": int,
+        "best_shot_end_frame": int,
+        "best_center_frame": int,
+        "fps": float,
+        "duration_sec": float,
+        "score": float,
+        "explanations": [...],
+        "llm_analysis": {...}
+    }
     """
-    print(os.getenv("NOVA_API_KEY"))
+
     client = OpenAI(
         api_key=os.getenv("NOVA_API_KEY"),
         base_url="https://api.nova.amazon.com/v1"
     )
 
-    # -----------------------------
+    # ============================================================
     # Helpers
-    # -----------------------------
-    def encode_image_b64(img_bgr: np.ndarray) -> str:
-        ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        if not ok:
-            raise RuntimeError("Failed to encode image")
-        return base64.b64encode(buf.tobytes()).decode("utf-8")
-
+    # ============================================================
     def resize_keep_aspect(img: np.ndarray, width: int) -> np.ndarray:
         h, w = img.shape[:2]
         if w <= width:
             return img
-        new_h = int(h * width / w)
-        return cv2.resize(img, (width, new_h), interpolation=cv2.INTER_AREA)
+        nh = int(h * width / w)
+        return cv2.resize(img, (width, nh), interpolation=cv2.INTER_AREA)
 
     def to_gray(img: np.ndarray) -> np.ndarray:
         return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    def hist_similarity(img1: np.ndarray, img2: np.ndarray) -> float:
-        """
-        Histogram correlation in [roughly -1, 1], larger is more similar.
-        """
+    def encode_b64_jpg(img: np.ndarray) -> str:
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok:
+            raise RuntimeError("Failed to encode image")
+        return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+    def hist_diff(img1: np.ndarray, img2: np.ndarray) -> float:
         h1 = cv2.calcHist([img1], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
         h2 = cv2.calcHist([img2], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
         cv2.normalize(h1, h1)
         cv2.normalize(h2, h2)
-        return float(cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL))
+        sim = cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
+        sim = max(min(sim, 1.0), -1.0)
+        return 1.0 - ((sim + 1.0) / 2.0)  # convert similarity to difference
 
-    def mean_abs_diff(img1_gray: np.ndarray, img2_gray: np.ndarray) -> float:
-        return float(np.mean(np.abs(img1_gray.astype(np.float32) - img2_gray.astype(np.float32))))
+    def mean_abs_diff(g1: np.ndarray, g2: np.ndarray) -> float:
+        return float(np.mean(np.abs(g1.astype(np.float32) - g2.astype(np.float32))))
 
-    def corner_density(img_gray: np.ndarray) -> float:
+    def detect_shot_boundaries(frames: List[np.ndarray]) -> List[int]:
         """
-        Surface with some texture is better than a blank or highly chaotic frame.
+        Return list of start indices of shots. Includes 0 and len(frames).
+        Uses a mix of histogram diff and gray diff, with adaptive threshold.
         """
-        corners = cv2.goodFeaturesToTrack(img_gray, maxCorners=300, qualityLevel=0.01, minDistance=8)
-        n = 0 if corners is None else len(corners)
-        area = img_gray.shape[0] * img_gray.shape[1]
-        return float(n / max(area, 1) * 1e5)
+        if len(frames) < 2:
+            return [0, len(frames)]
 
-    def motion_score(img1_gray: np.ndarray, img2_gray: np.ndarray) -> float:
-        """
-        Cheap motion proxy: mean abs diff after blur.
-        Smaller = more stable.
-        """
-        g1 = cv2.GaussianBlur(img1_gray, (5, 5), 0)
-        g2 = cv2.GaussianBlur(img2_gray, (5, 5), 0)
-        return mean_abs_diff(g1, g2)
+        diffs = []
+        for i in range(1, len(frames)):
+            f_prev = frames[i - 1]
+            f_cur = frames[i]
+            g_prev = to_gray(f_prev)
+            g_cur = to_gray(f_cur)
 
-    def build_contact_sheet(frames_triplet: List[np.ndarray], labels: List[str]) -> np.ndarray:
-        resized = []
+            hd = hist_diff(f_prev, f_cur)
+            gd = min(mean_abs_diff(g_prev, g_cur) / 60.0, 1.0)
+            score = 0.6 * hd + 0.4 * gd
+            diffs.append(score)
+
+        arr = np.array(diffs, dtype=np.float32)
+        mu = float(arr.mean())
+        sigma = float(arr.std() + 1e-6)
+
+        # adaptive cut threshold
+        thr = mu + 2.5 * sigma
+        thr = max(thr, 0.28)
+
+        shot_starts = [0]
+        for i, score in enumerate(diffs, start=1):
+            if score >= thr:
+                shot_starts.append(i)
+
+        if shot_starts[-1] != len(frames):
+            shot_starts.append(len(frames))
+
+        # remove duplicates just in case
+        shot_starts = sorted(set(shot_starts))
+        if shot_starts[0] != 0:
+            shot_starts = [0] + shot_starts
+        if shot_starts[-1] != len(frames):
+            shot_starts.append(len(frames))
+
+        return shot_starts
+
+    def sample_indices_in_shot(start: int, end: int, k: int) -> List[int]:
+        """
+        Sample k representative frames inside [start, end].
+        """
+        if end < start:
+            return []
+        length = end - start + 1
+        if length <= k:
+            return list(range(start, end + 1))
+        vals = np.linspace(start, end, num=k, dtype=int)
+        return vals.tolist()
+
+    def estimate_background_change_in_shot(frames: List[np.ndarray], indices: List[int]) -> Dict[str, float]:
+        """
+        Estimate whether the background is stable across sampled frames.
+
+        Idea:
+        - Try to align consecutive frames using feature matching + homography.
+        - After alignment, compute residual difference.
+        - Large local motion but small aligned residual means moving people only.
+        - Large aligned residual means background/camera change.
+        """
+        if len(indices) < 2:
+            return {
+                "background_change": 1.0,
+                "foreground_motion": 1.0,
+                "camera_instability": 1.0,
+                "bg_stability_score": 0.0,
+                "homography_success_rate": 0.0,
+            }
+
+        orb = cv2.ORB_create(1200)
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+        bg_changes = []
+        fg_motions = []
+        cam_instabilities = []
+        successes = 0
+
+        for a, b in zip(indices[:-1], indices[1:]):
+            img1 = frames[a]
+            img2 = frames[b]
+            g1 = to_gray(img1)
+            g2 = to_gray(img2)
+
+            kp1, des1 = orb.detectAndCompute(g1, None)
+            kp2, des2 = orb.detectAndCompute(g2, None)
+
+            if des1 is None or des2 is None or len(kp1) < 8 or len(kp2) < 8:
+                # fallback: treat as unstable
+                raw = min(mean_abs_diff(g1, g2) / 50.0, 1.0)
+                bg_changes.append(raw)
+                fg_motions.append(raw)
+                cam_instabilities.append(1.0)
+                continue
+
+            matches = bf.match(des1, des2)
+            matches = sorted(matches, key=lambda x: x.distance)
+
+            if len(matches) < 12:
+                raw = min(mean_abs_diff(g1, g2) / 50.0, 1.0)
+                bg_changes.append(raw)
+                fg_motions.append(raw)
+                cam_instabilities.append(1.0)
+                continue
+
+            pts1 = np.float32([kp1[m.queryIdx].pt for m in matches[:150]]).reshape(-1, 1, 2)
+            pts2 = np.float32([kp2[m.trainIdx].pt for m in matches[:150]]).reshape(-1, 1, 2)
+
+            H, mask = cv2.findHomography(pts2, pts1, cv2.RANSAC, 4.0)
+            if H is None:
+                raw = min(mean_abs_diff(g1, g2) / 50.0, 1.0)
+                bg_changes.append(raw)
+                fg_motions.append(raw)
+                cam_instabilities.append(1.0)
+                continue
+
+            successes += 1
+            warped2 = cv2.warpPerspective(img2, H, (img1.shape[1], img1.shape[0]))
+            gw2 = to_gray(warped2)
+
+            # residual after alignment ≈ background inconsistency / large structure change
+            residual = cv2.absdiff(g1, gw2)
+            residual_blur = cv2.GaussianBlur(residual, (5, 5), 0)
+
+            # threshold moving areas
+            _, moving_mask = cv2.threshold(residual_blur, 22, 255, cv2.THRESH_BINARY)
+            moving_ratio = float(np.mean(moving_mask > 0))
+
+            # estimate global residual
+            bg_change = min(float(np.mean(residual_blur)) / 45.0, 1.0)
+
+            # foreground motion:
+            # if moving regions are small/moderate but total frame remains aligned, that is okay
+            fg_motion = min(moving_ratio / 0.35, 1.0)
+
+            # camera instability from homography shape deviation
+            # if H is near identity, more stable
+            Hn = H / (H[2, 2] + 1e-8)
+            identity = np.eye(3, dtype=np.float32)
+            cam_inst = min(float(np.mean(np.abs(Hn - identity))) / 0.12, 1.0)
+
+            bg_changes.append(bg_change)
+            fg_motions.append(fg_motion)
+            cam_instabilities.append(cam_inst)
+
+        background_change = float(np.mean(bg_changes))
+        foreground_motion = float(np.mean(fg_motions))
+        camera_instability = float(np.mean(cam_instabilities))
+        homography_success_rate = successes / max(len(indices) - 1, 1)
+
+        # people motion is okay, background/camera change is not
+        bg_stability_score = (
+            0.65 * (1.0 - background_change) +
+            0.20 * (1.0 - camera_instability) +
+            0.15 * (foreground_motion)   # allows some motion, means scene is alive
+        )
+        bg_stability_score = float(max(0.0, min(bg_stability_score, 1.0)))
+
+        return {
+            "background_change": background_change,
+            "foreground_motion": foreground_motion,
+            "camera_instability": camera_instability,
+            "bg_stability_score": bg_stability_score,
+            "homography_success_rate": homography_success_rate,
+        }
+
+    def build_contact_sheet(frames_list: List[np.ndarray], labels: List[str]) -> np.ndarray:
         target_h = 220
-        for img, label in zip(frames_triplet, labels):
+        rendered = []
+        for img, label in zip(frames_list, labels):
             h, w = img.shape[:2]
-            new_w = int(w * target_h / h)
-            r = cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_AREA)
+            nw = int(w * target_h / h)
+            r = cv2.resize(img, (nw, target_h), interpolation=cv2.INTER_AREA)
             cv2.putText(
-                r, label, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA
+                r, label, (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2, cv2.LINE_AA
             )
-            resized.append(r)
-        return cv2.hconcat(resized)
+            rendered.append(r)
+        return cv2.hconcat(rendered)
 
-    def ask_llm_about_triplet(frames_triplet: List[np.ndarray], triplet_ids: List[int]) -> Dict[str, Any]:
+    def ask_llm_about_shot(
+        sampled_frames: List[np.ndarray],
+        sampled_indices: List[int],
+        shot_start: int,
+        shot_end: int
+    ) -> Dict[str, Any]:
         """
-        Ask Nova whether this location is good for product placement.
-        The LLM sees 3 frames stitched side-by-side.
+        Ask the LLM if the shot is suitable for product placement.
         """
         sheet = build_contact_sheet(
-            frames_triplet,
-            [f"frame {triplet_ids[0]}", f"frame {triplet_ids[1]}", f"frame {triplet_ids[2]}"]
+            sampled_frames,
+            [f"f{idx}" for idx in sampled_indices]
         )
-        sheet = resize_keep_aspect(sheet, 1400)
-        b64 = encode_image_b64(sheet)
+        sheet = resize_keep_aspect(sheet, 1600)
+        b64 = encode_b64_jpg(sheet)
         mime = "image/jpeg"
 
         prompt = """
-You are evaluating whether a video scene is a good candidate for inserting a product placement.
+You are evaluating a short continuous video shot for possible product placement.
 
-You are shown 3 frames from the same local moment in a video:
-left = earlier frame
-middle = candidate frame
-right = later frame
+You will see several frames sampled across time from the SAME shot.
 
-Decide if the middle frame is a good place for product placement.
+Your task is to determine whether there is a good place in the BACKGROUND where a product can be inserted naturally and consistently across the shot.
 
-Look for:
-1. Stable visible surface / region where an object or ad could be placed
-2. Background consistency across the 3 frames
-3. Low camera/object motion near the candidate region
-4. No obvious scene cut between the 3 frames
-5. Enough free space / non-occluded area
-6. The surface should not deform strongly across frames
+Focus on finding stable empty areas in the background, especially:
+- shelves
+- tables
+- counters
+- desks
+- cabinets
+- ledges
+- other flat or visually stable support surfaces
 
-Return ONLY valid JSON with this schema:
+Main priority:
+- Prefer placement in the BACKGROUND rather than foreground.
+- Prefer clearly visible empty space on a stable surface.
+- Prefer spots where the inserted product would look natural, believable, and remain consistent through the full shot.
+
+Important evaluation rules:
+- People moving is acceptable, as long as the background placement area remains stable and visible.
+- Background or support surface should stay visually stable across the sampled frames.
+- Camera motion should be small enough that the inserted product would still look believable.
+- Do NOT prefer foreground placements unless there is no good background option.
+- A good shot should contain a persistent empty region in the background where a product could realistically sit.
+- The best candidates are shelves, tables, counters, or similar flat background surfaces with enough visible free space.
+- Reject shots where the candidate area is heavily occluded, unstable, too small, or changes too much over time.
+- Reject shots where a scene cut or large background change appears inside the shot.
+
+Confidence guidance:
+- Set placement_confidence HIGH only when there is a clearly visible, stable, empty, believable background placement area.
+- The better, larger, clearer, and more stable the background spot is, the higher the confidence should be.
+- If only weak, partial, or uncertain placement areas exist, confidence should be low.
+- If no good background placement area exists, confidence should be very low.
+
+Return ONLY valid JSON in exactly this schema:
 {
   "good_for_product_placement": true,
   "placement_confidence": 0.0,
   "has_stable_surface": true,
   "background_consistent": true,
-  "has_scene_cut": false,
+  "people_motion_only": true,
   "free_space": 0.0,
   "suggested_region_description": "short text",
   "reasoning_short": "short explanation"
 }
 
-Notes:
-- placement_confidence is in [0,1]
-- free_space is in [0,1]
-- If there is a cut or major change, confidence should be low.
-- Output JSON only.
+Field guidance:
+- good_for_product_placement: true only if there is a genuinely usable background placement spot
+- placement_confidence: number from 0 to 1, where higher means a stronger and more reliable placement opportunity
+- has_stable_surface: true if there is a stable shelf/table/counter-like or otherwise believable support region
+- background_consistent: true if the placement area stays visually consistent across frames
+- people_motion_only: true if motion is mostly from people/foreground activity rather than background change
+- free_space: number from 0 to 1 representing how much usable empty space exists in the candidate placement area
+- suggested_region_description: briefly describe the best background placement location
+- reasoning_short: brief explanation focused on background suitability, stability, and empty space
+
 """.strip()
 
         user_message = (
-            f"Triplet frames are {triplet_ids}. "
-            f"Judge whether the middle frame {triplet_ids[1]} is a good spot for stable product placement."
+            f"These are frames sampled from one continuous shot, from frame {shot_start} to frame {shot_end}. "
+            f"Determine if this shot is good for product placement."
         )
 
         response = client.chat.completions.create(
@@ -198,241 +368,200 @@ Notes:
                     ]
                 }
             ],
-            max_tokens=600
+            max_tokens=700
         )
 
-        content = response.choices[0].message.content
+        text = response.choices[0].message.content.replace("```json", "").replace("```", "")
         try:
-            return json.loads(content)
+            return json.loads(text)
         except Exception:
             return {
                 "good_for_product_placement": False,
                 "placement_confidence": 0.0,
                 "has_stable_surface": False,
                 "background_consistent": False,
-                "has_scene_cut": True,
+                "people_motion_only": False,
                 "free_space": 0.0,
                 "suggested_region_description": "",
-                "reasoning_short": f"LLM JSON parse failed. Raw: {content[:200]}"
+                "reasoning_short": f"Failed to parse LLM JSON: {text[:200]}"
             }
 
-    def scene_change_score(img_prev: np.ndarray, img_cur: np.ndarray) -> float:
-        """
-        Higher means more likely a scene cut / large change.
-        """
-        hsim = hist_similarity(img_prev, img_cur)
-        gprev = to_gray(img_prev)
-        gcur = to_gray(img_cur)
-        mad = mean_abs_diff(gprev, gcur)
-
-        # Normalize roughly
-        h_part = 1.0 - max(min((hsim + 1) / 2, 1.0), 0.0)  # convert similarity -> difference
-        d_part = min(mad / 60.0, 1.0)
-
-        return 0.6 * h_part + 0.4 * d_part
-
-    def local_stability_score(frames_triplet: List[np.ndarray]) -> Dict[str, float]:
-        f0, f1, f2 = frames_triplet
-        g0, g1, g2 = map(to_gray, frames_triplet)
-
-        sim01 = hist_similarity(f0, f1)
-        sim12 = hist_similarity(f1, f2)
-        mot01 = motion_score(g0, g1)
-        mot12 = motion_score(g1, g2)
-        tex = corner_density(g1)
-
-        # Higher is better
-        sim_score = (sim01 + sim12) / 2.0
-        motion_penalty = (mot01 + mot12) / 2.0
-
-        # Convert to normalized-ish terms
-        sim_norm = max(0.0, min((sim_score + 1.0) / 2.0, 1.0))
-        motion_norm = max(0.0, 1.0 - min(motion_penalty / 25.0, 1.0))
-        texture_norm = min(tex / 30.0, 1.0)
-
-        # Slight preference for moderate texture
-        texture_quality = 1.0 - abs(texture_norm - 0.45)
-
-        score = 0.5 * sim_norm + 0.35 * motion_norm + 0.15 * texture_quality
-
-        return {
-            "cv_score": float(score),
-            "hist_similarity_avg": float(sim_score),
-            "motion_penalty": float(motion_penalty),
-            "texture_density": float(tex),
-            "scene_change_local": float(max(
-                scene_change_score(f0, f1),
-                scene_change_score(f1, f2)
-            ))
-        }
-
-    # -----------------------------
-    # Read all frames
-    # -----------------------------
+    # ============================================================
+    # Read video
+    # ============================================================
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {video_path}")
 
-    frames = []
-    idx = 0
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
+    if fps <= 1e-6:
+        fps = 30.0
+
+    frames: List[np.ndarray] = []
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         frames.append(resize_keep_aspect(frame, resize_width))
-        idx += 1
     cap.release()
 
-    n = len(frames)
-    if n < 2 * triplet_gap + 1:
-        raise ValueError("Video too short for triplet analysis")
+    if len(frames) < 3:
+        raise ValueError("Video is too short")
 
-    # -----------------------------
-    # Step 1: CV prefilter
-    # -----------------------------
-    candidates = []
-    for center in range(triplet_gap, n - triplet_gap, step):
-        triplet_idx = [center - triplet_gap, center, center + triplet_gap]
-        triplet = [frames[triplet_idx[0]], frames[triplet_idx[1]], frames[triplet_idx[2]]]
-        cv_stats = local_stability_score(triplet)
+    # ============================================================
+    # 1. Detect cuts / shots
+    # ============================================================
+    shot_boundaries = detect_shot_boundaries(frames)
 
-        # Keep only reasonably stable local triplets
-        if cv_stats["scene_change_local"] < cut_threshold and cv_stats["motion_penalty"] < 20:
-            candidates.append({
-                "center": center,
-                "triplet_idx": triplet_idx,
-                "cv_stats": cv_stats
-            })
+    shots: List[Tuple[int, int]] = []
+    for s, e in zip(shot_boundaries[:-1], shot_boundaries[1:]):
+        print(s, e)
+        # treat shot as [s, e-1]
+        if e - s <= 0:
+            continue
+        shots.append((s, e - 1))
 
-    if not candidates:
+    if not shots:
         return {
+            "best_shot_start_frame": None,
+            "best_shot_end_frame": None,
             "best_center_frame": None,
-            "scene_start_frame": None,
-            "scene_end_frame": None,
-            "triplet_checked": None,
+            "fps": fps,
+            "duration_sec": None,
             "score": 0.0,
-            "explanations": ["No stable candidate triplets found by CV prefilter."],
+            "explanations": ["No shots detected."],
             "llm_analysis": None
         }
 
-    # Sort by CV quality and keep top few for LLM
-    candidates = sorted(candidates, key=lambda x: x["cv_stats"]["cv_score"], reverse=True)
-    candidates = candidates[:max_llm_candidates]
+    # ============================================================
+    # 2. Filter by shot length
+    # ============================================================
+    valid_shots = []
+    for start, end in shots:
+        duration_sec = (end - start + 1) / fps
+        if duration_sec < min_shot_sec:
+            continue
+        if duration_sec > max_shot_sec:
+            continue
 
-    # -----------------------------
-    # Step 2: LLM on shortlisted candidates
-    # -----------------------------
+        valid_shots.append((start, end, duration_sec))
+
+    if not valid_shots:
+        return {
+            "best_shot_start_frame": None,
+            "best_shot_end_frame": None,
+            "best_center_frame": None,
+            "fps": fps,
+            "duration_sec": None,
+            "score": 0.0,
+            "explanations": [
+                f"No valid shots in the allowed duration range [{min_shot_sec}, {max_shot_sec}] sec."
+            ],
+            "llm_analysis": None
+        }
+
+    # ============================================================
+    # 3. CV background evaluation for each valid shot
+    # ============================================================
+    scored_shots = []
+    for start, end, duration_sec in valid_shots:
+        sampled_idx = sample_indices_in_shot(start, end, sample_frames_per_shot)
+        sampled_frames = [frames[i] for i in sampled_idx]
+        print(sampled_idx)
+
+        bg_stats = estimate_background_change_in_shot(frames, sampled_idx)
+        print(bg_stats["bg_stability_score"], bg_stats["background_change"], bg_stats["homography_success_rate"])
+
+        # Prefer:
+        # - low background change
+        # - low camera instability
+        # - enough homography success
+        cv_score = (
+            0.55 * bg_stats["bg_stability_score"] +
+            0.25 * (1.0 - bg_stats["background_change"]) +
+            0.20 * bg_stats["homography_success_rate"]
+        )
+        cv_score = float(max(0.0, min(cv_score, 1.0)))
+
+        scored_shots.append({
+            "start": start,
+            "end": end,
+            "duration_sec": duration_sec,
+            "sampled_idx": sampled_idx,
+            "bg_stats": bg_stats,
+            "cv_score": cv_score,
+        })
+
+    scored_shots.sort(key=lambda x: x["cv_score"], reverse=True)
+    scored_shots = scored_shots[:max_llm_shots]
+
+    # ============================================================
+    # 4. Ask LLM on best CV candidate shots
+    # ============================================================
     enriched = []
-    for cand in candidates:
-        print("Checking candidate:", cand["center"])
-        ids = cand["triplet_idx"]
-        triplet = [frames[ids[0]], frames[ids[1]], frames[ids[2]]]
+    for shot in scored_shots:
+        sampled_frames = [frames[i] for i in shot["sampled_idx"]]
+        llm = ask_llm_about_shot(
+            sampled_frames=sampled_frames,
+            sampled_indices=shot["sampled_idx"],
+            shot_start=shot["start"],
+            shot_end=shot["end"]
+        )
 
-        llm = ask_llm_about_triplet(triplet, ids)
-
-        llm_conf = float(llm.get("placement_confidence", 0.0))
+        conf = float(llm.get("placement_confidence", 0.0))
         free_space = float(llm.get("free_space", 0.0))
         good = bool(llm.get("good_for_product_placement", False))
         stable_surface = bool(llm.get("has_stable_surface", False))
         bg_consistent = bool(llm.get("background_consistent", False))
-        has_cut = bool(llm.get("has_scene_cut", True))
+        people_motion_only = bool(llm.get("people_motion_only", False))
 
         llm_score = 0.0
-        llm_score += 0.45 * llm_conf
+        llm_score += 0.40 * conf
         llm_score += 0.20 * free_space
         llm_score += 0.15 if good else 0.0
         llm_score += 0.10 if stable_surface else 0.0
         llm_score += 0.10 if bg_consistent else 0.0
-        llm_score -= 0.35 if has_cut else 0.0
-        llm_score = max(llm_score, 0.0)
+        llm_score += 0.05 if people_motion_only else 0.0
+        llm_score = float(max(0.0, min(llm_score, 1.0)))
 
-        total_score = 0.45 * cand["cv_stats"]["cv_score"] + 0.55 * llm_score
+        total_score = llm_score#0.50 * shot["cv_score"] + 0.50 * llm_score
 
         enriched.append({
-            **cand,
+            **shot,
             "llm": llm,
-            "llm_score": float(llm_score),
-            "total_score": float(total_score)
+            "llm_score": llm_score,
+            "total_score": total_score,
         })
+        print("--------------------------------")
+        print(llm, llm_score)
+        print("--------------------------------")
 
-    enriched = sorted(enriched, key=lambda x: x["total_score"], reverse=True)
+    enriched.sort(key=lambda x: x["total_score"], reverse=True)
     best = enriched[0]
 
-    best_center = best["center"]
+    best_center = (best["start"] + best["end"]) // 2
 
-    # -----------------------------
-    # Step 3: Expand interval with CV only
-    # -----------------------------
-    def expand_left(center_idx: int) -> int:
-        start = center_idx
-        for i in range(center_idx, 0, -1):
-            change = scene_change_score(frames[i - 1], frames[i])
-            gprev = to_gray(frames[i - 1])
-            gcur = to_gray(frames[i])
-            mot = motion_score(gprev, gcur)
-
-            if change > cut_threshold or mot > 25:
-                break
-            start = i - 1
-        return start
-
-    def expand_right(center_idx: int) -> int:
-        end = center_idx
-        for i in range(center_idx, n - 1):
-            change = scene_change_score(frames[i], frames[i + 1])
-            g1 = to_gray(frames[i])
-            g2 = to_gray(frames[i + 1])
-            mot = motion_score(g1, g2)
-
-            if change > cut_threshold or mot > 25:
-                break
-            end = i + 1
-        return end
-
-    left = expand_left(best_center)
-    right = expand_right(best_center)
-
-    # If too short, keep local triplet at minimum
-    if right - left + 1 < min_interval_len:
-        left = max(0, best_center - triplet_gap)
-        right = min(n - 1, best_center + triplet_gap)
-
-    # -----------------------------
-    # Step 4: Build explanations
-    # -----------------------------
-    explanations = []
-
-    explanations.append(
-        f"Best center frame is {best_center} because it had the strongest combined CV+LLM score "
-        f"({best['total_score']:.3f})."
-    )
-
-    explanations.append(
-        f"Triplet checked: {best['triplet_idx']}. "
-        f"Local visual stability score={best['cv_stats']['cv_score']:.3f}, "
-        f"avg histogram similarity={best['cv_stats']['hist_similarity_avg']:.3f}, "
-        f"motion penalty={best['cv_stats']['motion_penalty']:.3f}."
-    )
-
-    explanations.append(
-        f"LLM judged placement confidence={best['llm_score']:.3f}. "
-        f"Reason: {best['llm'].get('reasoning_short', 'No reason returned')}."
-    )
-
-    explanations.append(
-        f"Continuous scene interval estimated from frame {left} to {right} "
-        f"using cut detection and frame-to-frame stability only."
-    )
-
+    explanations = [
+        f"Best shot is frames {best['start']} to {best['end']} "
+        f"({best['duration_sec']:.2f} sec).",
+        f"The shot passed the duration filter: between {min_shot_sec:.1f} sec and {max_shot_sec:.1f} sec.",
+        f"Background stability score={best['bg_stats']['bg_stability_score']:.3f}, "
+        f"background_change={best['bg_stats']['background_change']:.3f}, "
+        f"camera_instability={best['bg_stats']['camera_instability']:.3f}, "
+        f"foreground_motion={best['bg_stats']['foreground_motion']:.3f}.",
+        f"Sampled frames for LLM: {best['sampled_idx']}.",
+        f"LLM reasoning: {best['llm'].get('reasoning_short', 'No explanation returned')}",
+    ]
     region_desc = best["llm"].get("suggested_region_description", "")
     if region_desc:
-        explanations.append(f"Suggested placement region: {region_desc}")
+        explanations.append(f"Suggested insertion region: {region_desc}")
 
     return {
+        "best_shot_start_frame": best["start"],
+        "best_shot_end_frame": best["end"],
         "best_center_frame": best_center,
-        "scene_start_frame": left,
-        "scene_end_frame": right,
-        "triplet_checked": best["triplet_idx"],
+        "fps": fps,
+        "duration_sec": best["duration_sec"],
         "score": best["total_score"],
         "explanations": explanations,
         "llm_analysis": best["llm"]
@@ -440,10 +569,8 @@ Notes:
     
 if __name__ == "__main__":
     
-    result = find_best_product_placement_interval(
-    video_path="hs_video.mp4",
-    step=5,
-    triplet_gap=2
+    result = find_best_product_placement_shot(
+    video_path="../hs_video.mp4"
     )
 
     print(json.dumps(result, indent=2))
