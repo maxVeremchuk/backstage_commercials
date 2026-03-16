@@ -74,7 +74,7 @@ def find_it_on_amazon():
     # else:
 
     # frame_url is frame_name in the tmp directory
-    frame = to_data_url("a.jpg", "image/jpeg")
+    frame = to_data_url(frame_url, "image/jpeg")
     text_prompt = data.get("user_prompt", None)
 
     return ask_nova_search_product_agent(client, input_image=frame, text_prompt=text_prompt)
