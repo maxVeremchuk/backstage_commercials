@@ -55,3 +55,18 @@ Two Nova agents work together through Flask endpoints:
 
 ## What's next for BackstageCommercials
 * **2D to 3D:** upgrade our placement pipeline from flat-surface, mostly static scenes to 3D-aware product insertion. This would let us handle camera motion, perspective shifts, and more dynamic environments while keeping placements physically believable.
+
+----
+# How to run
+#### Call Amazon Nova 2 Lite and NovaAct Agents:
+```
+python agent_api.py
+```
+Endpoints:
+```
+/find-it-on-amazon # Amazon Nova 2 Lite processes input frame and user request, returns Amazon link and item description.
+/select-similar-from-amazon # NovaAct uses product description and find two (k=2 by default) best items that fit description well. Returns URL of the selected items.
+/select-similar-from-amazon/add_to_list # Same as above but instead adds to the selected list on  Amazon.
+/add-it-to-shopping-cart # NovaAct adds the product to the user's shopping cart.
+/add-it-to-shopping-list # using product link adds it to the user's shopping cart.
+```
