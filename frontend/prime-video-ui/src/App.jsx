@@ -1,5 +1,5 @@
 import React, { useMemo, useRef, useState, useEffect } from "react";
-import { Play, ArrowLeft, Search, Star } from "lucide-react";
+import { Play, ArrowLeft, Search, Star, Sparkles } from "lucide-react";
 
 const styles = `
   * { box-sizing: border-box; }
@@ -481,6 +481,7 @@ const styles = `
     display: flex;
     align-items: center;
     gap: 14px;
+    flex-wrap: wrap;
   }
 
   .play-btn {
@@ -495,6 +496,25 @@ const styles = `
     cursor: pointer;
   }
 
+  .nova-btn {
+    border: none;
+    background: linear-gradient(135deg, #ffb347 0%, #ff7a18 100%);
+    color: white;
+    border-radius: 12px;
+    padding: 10px 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    font-weight: 700;
+    box-shadow: 0 8px 18px rgba(255, 122, 24, 0.28);
+  }
+
+  .nova-btn:disabled {
+    opacity: 0.7;
+    cursor: wait;
+  }
+
   .time-label,
   .frame-label {
     color: rgba(255,255,255,0.84);
@@ -502,26 +522,26 @@ const styles = `
   }
 
   .product-overlay {
-  position: absolute;
-  left: 24px;
-  right: 24px;
-  bottom: 12px;
-  width: auto;
-  max-width: 760px;
-  z-index: 5;
-  display: grid;
-  grid-template-columns: 100px 1fr;
-  gap: 12px;
-  padding: 0px 12px;
-  border-radius: 16px;
-  background: rgba(7, 16, 28, 0.88);
-  border: 1px solid rgba(255,255,255,0.12);
-  backdrop-filter: blur(10px);
-  box-shadow: 0 16px 34px rgba(0,0,0,0.4);
-  cursor: pointer;
-  transition: opacity 0.25s ease, transform 0.25s ease;
-  transform: translateY(8px);
-}
+    position: absolute;
+    left: 24px;
+    right: 24px;
+    bottom: 12px;
+    width: auto;
+    max-width: 760px;
+    z-index: 5;
+    display: grid;
+    grid-template-columns: 100px 1fr;
+    gap: 12px;
+    padding: 0px 12px;
+    border-radius: 16px;
+    background: rgba(7, 16, 28, 0.88);
+    border: 1px solid rgba(255,255,255,0.12);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 16px 34px rgba(0,0,0,0.4);
+    cursor: pointer;
+    transition: opacity 0.25s ease, transform 0.25s ease;
+    transform: translateY(8px);
+  }
 
   .product-overlay-out {
     opacity: 0;
@@ -594,6 +614,57 @@ const styles = `
     margin-top: 8px;
     font-size: 12px;
     color: rgba(255,255,255,0.7);
+  }
+
+  .nova-toast {
+    position: absolute;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%) translateY(-10px);
+    z-index: 8;
+    min-width: 320px;
+    max-width: min(92%, 760px);
+    padding: 14px 16px;
+    border-radius: 16px;
+    background: rgba(10, 22, 38, 0.96);
+    border: 1px solid rgba(255,255,255,0.14);
+    box-shadow: 0 20px 40px rgba(0,0,0,0.45);
+    backdrop-filter: blur(10px);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.28s ease, transform 0.28s ease;
+  }
+
+  .nova-toast-show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+    pointer-events: auto;
+  }
+
+  .nova-toast-title {
+    font-size: 14px;
+    font-weight: 800;
+    color: #ffbe66;
+    margin-bottom: 6px;
+  }
+
+  .nova-toast-text {
+    font-size: 14px;
+    line-height: 1.45;
+    color: rgba(255,255,255,0.9);
+    margin-bottom: 8px;
+  }
+
+  .nova-toast-link {
+    font-size: 14px;
+    font-weight: 700;
+    color: #8fc7ff;
+    text-decoration: none;
+    word-break: break-all;
+  }
+
+  .nova-toast-link:hover {
+    text-decoration: underline;
   }
 
   .loading-box,
@@ -951,6 +1022,8 @@ function EpisodePlayer({ show }) {
   const [hasStarted, setHasStarted] = useState(false);
   const [showProductOverlay, setShowProductOverlay] = useState(false);
   const [isOverlayLeaving, setIsOverlayLeaving] = useState(false);
+  const [isNovaLoading, setIsNovaLoading] = useState(false);
+  const [showNovaToast, setShowNovaToast] = useState(false);
 
   const fps = 30;
   const src = show.videoSrc;
@@ -967,6 +1040,8 @@ function EpisodePlayer({ show }) {
     setDuration(0);
     setIsPlaying(false);
     setHasStarted(false);
+    setIsNovaLoading(false);
+    setShowNovaToast(false);
 
     const onLoaded = () => setDuration(video.duration || 0);
     const onTime = () => setCurrentTime(video.currentTime || 0);
@@ -1033,6 +1108,22 @@ function EpisodePlayer({ show }) {
     video.currentTime = Math.max(0, Math.min(duration, ratio * duration));
   };
 
+  const handleNovaSearch = () => {
+    if (isNovaLoading) return;
+
+    setIsNovaLoading(true);
+    setShowNovaToast(false);
+
+    setTimeout(() => {
+      setIsNovaLoading(false);
+      setShowNovaToast(true);
+
+      setTimeout(() => {
+        setShowNovaToast(false);
+      }, 9000);
+    }, 6000);
+  };
+
   useEffect(() => {
     if (displayZoneActive) {
       setShowProductOverlay(true);
@@ -1055,6 +1146,25 @@ function EpisodePlayer({ show }) {
     <div>
       <div className="video-stage">
         <div className="video-wrap">
+          {showNovaToast && (
+            <div className={`nova-toast ${showNovaToast ? "nova-toast-show" : ""}`}>
+              <div className="nova-toast-title">Amazon Nova Search</div>
+              <div className="nova-toast-text">
+                Prompt found product match: {show.productTitle || "Detected product"}.
+              </div>
+              {"https://www.amazon.com/exec/obidos/asin/B01C35MZVG/rdbests-20/?utm_source=nova.amazon.com" && (
+                <a
+                  href={"https://www.amazon.com/exec/obidos/asin/B01C35MZVG/rdbests-20/?utm_source=nova.amazon.com"}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="nova-toast-link"
+                >
+                  {"https://www.amazon.com/exec/obidos/asin/B01C35MZVG/rdbests-20/?utm_source=nova.amazon.com"}
+                </a>
+              )}
+            </div>
+          )}
+
           <video
             ref={videoRef}
             src={src}
@@ -1112,14 +1222,25 @@ function EpisodePlayer({ show }) {
               <Play size={16} />
               <span>{isPlaying ? "Pause" : "Play"}</span>
             </button>
+
+            <button
+              onClick={handleNovaSearch}
+              className="nova-btn"
+              type="button"
+              disabled={isNovaLoading}
+            >
+              <Sparkles size={16} />
+              <span>{isNovaLoading ? "Listening..." : "Ask Nova"}</span>
+            </button>
+
             <span className="time-label">
               {formatTime(currentTime)} / {formatTime(duration)}
             </span>
           </div>
 
-          <div className="frame-label">
+          {/* <div className="frame-label">
             Highlight frames: {highlightStartFrame} - {highlightEndFrame}
-          </div>
+          </div> */}
         </div>
       </div>
     </div>
