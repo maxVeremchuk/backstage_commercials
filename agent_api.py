@@ -58,7 +58,7 @@ def call_nova(body, agent: str = "add_it_to_shopping_cart", *args, **kwargs):
     nova.start()
     result = False
     if agent == "add_it_to_shopping_cart":
-        result = ask_nova_add_it_to_cart_agent(nova, body)
+        result = ask_nova_add_it_to_cart_agent(nova, body, add_to_wishlist=kwargs.get('add_to_wishlist', ''))
     elif agent == "select_similar_from_amazon":
         result = ask_nova_search_similar_agent(nova, body, k=kwargs.get('k', 1), add_to_wishlist=kwargs.get('add_to_wishlist', ''))
     nova.stop()
@@ -74,7 +74,7 @@ def find_it_on_amazon():
     # else:
 
     # frame_url is frame_name in the tmp directory
-    frame = to_data_url(frame_url, "image/jpeg")
+    frame = to_data_url("a.jpg", "image/jpeg")
     text_prompt = data.get("user_prompt", None)
 
     return ask_nova_search_product_agent(client, input_image=frame, text_prompt=text_prompt)
@@ -97,6 +97,12 @@ def select_similar_from_amazon_and_add_to_list():
 def add_it_to_shopping_cart():
     data = request.get_json()
     return {"agent_finished": call_nova(data.get("product_url", None), "add_it_to_shopping_cart")}
+
+@app.route("/add-it-to-shopping-list", methods=["POST"])
+def add_it_to_shopping_list():
+    data = request.get_json()
+    list_name = data.get('list_name', 'wishlist')
+    return {"agent_finished": call_nova(data.get("product_url", None), "add_it_to_shopping_cart", add_to_wishlist=f'Add product to the "{list_name}".')}
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000)
