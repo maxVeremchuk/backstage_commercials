@@ -70,3 +70,10 @@ Endpoints:
 /add-it-to-shopping-cart # NovaAct adds the product to the user's shopping cart.
 /add-it-to-shopping-list # using product link adds it to the user's shopping cart.
 ```
+#### Run Frontend App
+```
+cd frontend/prime-video-ui
+npm install
+npm install lucide-react
+npm run dev
+```
