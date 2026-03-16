@@ -89,10 +89,14 @@ Place a coffee jar naturally in the image.
 
 Rules:
 - Must be in the BACKGROUND
+- Must be upper part of the image
+- Change the size to fit it on the background.
 - Must be BEHIND people
 - Must sit on a surface
 - Must NOT float
 - Look for empty space on the surface to place the product.
+- Try to put on more visible surface, sunny place, on the background.
+- Do not cover people or their head.
 
 Coordinates must be normalized (0..1).
 
@@ -126,10 +130,10 @@ Rules:
 - Must be in the BACKGROUND
 - Look for the gap between objects to place the product.
 - Must be BEHIND people
+- Bigger part must be visible
 - Must sit on a surface
 - Must NOT float
 
-ead 
 
 Coordinates must be normalized (0..1).
 
@@ -160,14 +164,15 @@ Return JSON:
 # Evaluation prompt
 # ----------------------------------------------------
 
-evaluation_prompt = """
+evaluation_prompt_template = """
 You are verifying whether an inserted product placement is physically believable.
 
 You are given:
 - the image with the product inserted
 - the previous bounding box coordinates
+- the product being evaluated: {product_description}
 
-Your task is to approve the placement ONLY if the product is clearly supported by a real surface in the scene.
+Your task is to approve the placement if the product can be physically placed there.
 
 Main rule:
 - The product must be touching and resting on a visible support surface such as:
@@ -177,6 +182,7 @@ Main rule:
   - counter
   - cabinet top
   - ledge
+  - floor (for according product) or grass or pavement for large products
   - other clearly visible horizontal support surface
 
 Strict approval policy:
@@ -186,6 +192,9 @@ Strict approval policy:
 - If the product is intersecting too deeply into the surface, mark invalid.
 - If there is no clear visible supporting surface directly under the product, mark invalid.
 - If the product appears attached to air, wall, person, or unsupported background region, mark invalid.
+- Reject if the product part is out of the screen and it is cutted (bbox is out of the image)
+- Reject if the product is on the balck space of the frame.
+- Reject if the product mostly on the human.
 
 Additional criteria:
 - correct scale relative to nearby objects
@@ -204,16 +213,16 @@ Important:
 
 Return ONLY valid JSON:
 
-{
+{{
   "valid": true,
   "reason": "...",
   "issues": "describe specific problems if any"
-}
+}}
 
 Set valid=true only if the product clearly touches and rests on a visible surface.
 Set valid=false if there are any clear issues, especially:
 - floating
-- no visible support surface
+- no visible support surface (for the ground, the bottom of the product's bounding box be on the ground.)
 - bottom not aligned with surface top
 - wrong scale
 - physically implausible placement
@@ -277,11 +286,13 @@ def ask_placement_model(image_path, user_text, previous_bbox=None):
 # Ask evaluation model
 # ----------------------------------------------------
 
-def ask_evaluation_model(image_path, bbox):
+def ask_evaluation_model(image_path, bbox, product_description):
 
     mime, b64 = encode_image(image_path)
 
     user_text = f"Evaluate the product placement. Current bbox: {json.dumps(bbox)}"
+
+    evaluation_prompt = evaluation_prompt_template.format(product_description=product_description)
 
     response = client.chat.completions.create(
 
@@ -381,7 +392,7 @@ def recursive_placement(background, product, product_description, max_iters=6):
             current_image = output_img
 
             # Step 3: Evaluate the placement with evaluation model
-            eval_result = ask_evaluation_model(current_image, current_bbox)
+            eval_result = ask_evaluation_model(current_image, current_bbox, product_description)
 
             eval_data = extract_json(eval_result)
 
@@ -447,9 +458,9 @@ def recursive_placement(background, product, product_description, max_iters=6):
 # ----------------------------------------------------
 
 if __name__ == "__main__":
-    background = "../first_hs.png"
-    product = "../timhortons_nobg.png"
-    product_description = "Tim Hortons 100% Arabica Original Blend"
+    background = "../dh_first.png"
+    product = "../bike_nobg.png"
+    product_description = "Bicycle" #"Tim Hortons 100% Arabica Original Blend"
 
     final_image, bbox_coords = recursive_placement(background, product, product_description)
 
